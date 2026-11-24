@@ -1,0 +1,17 @@
+# Backend + MongoDB. Run the frontend with `npm run dev` in ./frontend (see README).
+services:
+  mongo:
+    image: mongo:7
+    volumes: [mongo_data:/data/db]
+    ports: ["27017:27017"]
+  backend:
+    build: ./backend
+    environment:
+      DB_BACKEND: mongo
+      MONGO_URI: mongodb://mongo:27017
+      STORAGE_ROOT: /data/storage
+    volumes: ["./storage:/data/storage"]
+    ports: ["8000:8000"]
+    depends_on: [mongo]
+volumes:
+  mongo_data:
