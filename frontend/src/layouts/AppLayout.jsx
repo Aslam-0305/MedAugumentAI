@@ -1,8 +1,8 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { Link, NavLink, Outlet } from 'react-router-dom'
 
 const links = [
   {
-    to: '/',
+    to: '/app',
     label: 'Dashboard',
     end: true,
     icon: (
@@ -55,9 +55,9 @@ export default function AppLayout() {
         <div>
           {/* Logo Header */}
           <div className="px-6 py-6 border-b" style={{ borderColor: 'rgba(255, 255, 255, 0.08)' }}>
-            <div className="flex items-center gap-3">
+            <Link to="/" className="flex items-center gap-3 group transition-opacity hover:opacity-95" title="View Landing Page">
               <div
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl shadow-lg"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl shadow-lg group-hover:scale-105 transition-transform"
                 style={{
                   background: 'linear-gradient(135deg, #0D9488 0%, #4F46E5 100%)',
                   boxShadow: '0 4px 14px rgba(13, 148, 136, 0.4)',
@@ -75,7 +75,7 @@ export default function AppLayout() {
                   Radiology Dataset Studio
                 </p>
               </div>
-            </div>
+            </Link>
           </div>
 
           {/* Navigation Links */}

@@ -1,6 +1,8 @@
 """Dataset creation, validation and queries (design §4, §9 steps 1-4)."""
 from __future__ import annotations
 
+import concurrent.futures
+import os
 import secrets
 import shutil
 from collections import Counter, defaultdict
@@ -36,9 +38,26 @@ def list_datasets(ctx: AppContext) -> list[dict]:
     return [public_dataset(d) for d in ctx.store.find("datasets", sort=[("created_at", -1)])]
 
 
+def _find_manifests(root: Path) -> list[Path]:
+    manifest_exts = {".csv", ".xlsx", ".xls"}
+    candidates = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in manifest_exts and len(p.relative_to(root).parts) <= 3
+        and not p.name.startswith("._") and not p.name.startswith("~$") and p.name.lower() not in ingestion.JUNK
+    ]
+    if not candidates:
+        return []
+    # If an explicit single master manifest exists, use that directly
+    master_manifests = [p for p in candidates if p.name.lower() in ("manifest.csv", "manifest.xlsx", "dataset.csv", "dataset.xlsx")]
+    if master_manifests:
+        csvs = [p for p in master_manifests if p.suffix.lower() == ".csv"]
+        return [csvs[0]] if csvs else [master_manifests[0]]
+    return sorted(candidates, key=lambda p: (len(p.parts), p.name.lower()))
+
+
 def _find_manifest(root: Path) -> Path | None:
-    csvs = [p for p in root.rglob("*.csv") if len(p.relative_to(root).parts) <= 2]
-    return csvs[0] if len(csvs) == 1 else None
+    found = _find_manifests(root)
+    return found[0] if len(found) == 1 else None
 
 
 def create_dataset(ctx: AppContext, *, name: str, modality: str, layout: str, archives: list[Path],
@@ -67,11 +86,11 @@ def create_dataset(ctx: AppContext, *, name: str, modality: str, layout: str, ar
             shutil.move(str(tmp), dest)
         index = FileIndex(original)
         if layout == "manifest":
-            manifest = manifest or _find_manifest(original)
-            if manifest is None:
-                raise AppError("Manifest layout needs a CSV manifest (upload it separately or include a single CSV in the archive)", 400, "bad_manifest")
-            shutil.copy(manifest, storage.manifests_dir(dataset_id) / "manifest.csv")
-            parsed = ingestion.parse_manifest(manifest)
+            manifest_files = [manifest] if manifest else _find_manifests(original)
+            if not manifest_files:
+                raise AppError("Manifest layout needs a CSV or Excel manifest (upload it separately or include it in the archive)", 400, "bad_manifest")
+            parsed, unified_csv = ingestion.parse_manifests(manifest_files)
+            (storage.manifests_dir(dataset_id) / "manifest.csv").write_text(unified_csv, encoding="utf-8")
         else:
             parsed = ingestion.parse_folders(original, index)
         doc, images = _validate_and_build(ctx, dataset_id, name, modality, layout, parsed, index, adapter)
@@ -87,7 +106,6 @@ def _validate_and_build(ctx, dataset_id, name, modality, layout, parsed: Parsed,
     storage = ctx.storage
     salt = secrets.token_hex(16)
     issues = list(parsed.issues)
-    images: list[dict] = []
     seen_paths: dict[str, int] = {}
     seen_hash: dict[str, str] = {}
     phi: Counter = Counter()
@@ -96,59 +114,103 @@ def _validate_and_build(ctx, dataset_id, name, modality, layout, parsed: Parsed,
     if not has_patient_col:
         issues.append(issue("warning", "no_patient_id", "No patient/subject IDs were provided: every image is treated as its own subject, so a patient-level split cannot prevent leakage between images of the same patient."))
 
+    # Pass 1: Quick preliminary checks (missing paths, labels, duplicate paths, missing files)
+    preliminary_records = []
+    to_load = []
+
     for n, rec in enumerate(parsed.records, start=1):
         image_id = f"{dataset_id}_i{n:06d}"
         ref = f"row {rec.row}" if layout == "manifest" else (rec.paths[0] if rec.paths else f"item {n}")
         local: list[dict] = []
-        doc = {"image_id": image_id, "dataset_id": dataset_id, "modality": modality, "labels": sorted(set(rec.labels)),
-               "source_split": rec.split, "split": None, "status": "invalid", "created_at": utcnow(), "source_ref": ref}
+        doc = {
+            "image_id": image_id, "dataset_id": dataset_id, "modality": modality, "labels": sorted(set(rec.labels)),
+            "source_split": rec.split, "split": None, "status": "invalid", "created_at": utcnow(), "source_ref": ref
+        }
         raw = rec.raw_patient or f"__image__{image_id}"
         doc["patient_id"] = pseudonymize(salt, raw)
+
+        if not rec.paths:
+            local.append(issue("error", "missing_path", "No image path given", ref))
+        if not doc["labels"]:
+            local.append(issue("error", "missing_label", "Image has no label (all-zero or empty label cells)", ref))
+
+        key = "|".join(rec.paths)
+        if key in seen_paths and rec.paths:
+            local.append(issue("error", "duplicate_path", f"Path repeated (first used in row {seen_paths[key]})", ref))
+        seen_paths.setdefault(key, rec.row)
+
+        paths = rec.resolved or [index.resolve(p) for p in rec.paths]
+        if rec.paths and any(p is None for p in paths):
+            missing = [rp for rp, p in zip(rec.paths, paths) if p is None]
+            local.append(issue("error", "missing_file", f"File not found in the upload: {missing[0]}", ref))
+
+        has_error = any(i["level"] == "error" for i in local)
+        preliminary_records.append((n, rec, doc, local, paths, has_error))
+        if not has_error:
+            to_load.append((n, rec, ref, paths))
+
+    # Pass 2: Heavy image decoding, adapter validation, and hashing across thread pool
+    def _load_and_validate(item):
+        n, rec, ref, paths = item
+        load_issues = []
+        phi_tags = []
+        image_data = None
+        digest = None
         try:
-            if not rec.paths:
-                local.append(issue("error", "missing_path", "No image path given", ref))
-            if not doc["labels"]:
-                local.append(issue("error", "missing_label", "Image has no label (all-zero or empty label cells)", ref))
-            key = "|".join(rec.paths)
-            if key in seen_paths and rec.paths:
-                local.append(issue("error", "duplicate_path", f"Path repeated (first used in row {seen_paths[key]})", ref))
-            seen_paths.setdefault(key, rec.row)
-            paths = rec.resolved or [index.resolve(p) for p in rec.paths]
-            if rec.paths and any(p is None for p in paths):
-                missing = [rp for rp, p in zip(rec.paths, paths) if p is None]
-                local.append(issue("error", "missing_file", f"File not found in the upload: {missing[0]}", ref))
-            if not any(i["level"] == "error" for i in local):
-                if modality != "mri" and len(paths) > 1:
-                    local.append(issue("error", "multiple_paths", "Several paths per row are only supported for MRI sequences", ref))
-                else:
-                    img = load_image_set(paths, modality)
-                    mask_note = _attach_mask(rec, img, index, modality, local, ref, storage)
-                    for it in adapter.validate_input(img):
-                        local.append({**it, "ref": ref})
-                    for t in img.meta.get("phi_tags", []):
-                        phi[t] += 1
-                    safe = {k: v for k, v in img.meta.items() if k != "phi_tags"}
-                    if not any(i["level"] == "error" for i in local):
-                        files = [p for p in paths if p.is_file()]
-                        digest = "-".join(sha256_file(p) for p in files)[:128] if files and len(files) == len(paths) else None
-                        if digest and digest in seen_hash:
-                            local.append(issue("warning", "duplicate_content", f"Identical file content to {seen_hash[digest]}: duplicates can leak across splits", ref))
-                        elif digest:
-                            seen_hash[digest] = image_id
-                        doc.update({
-                            "status": "valid", "format": img.fmt, "file_paths": [storage.key(p) for p in paths], "file_path": storage.key(paths[0]),
-                            "mask_path": mask_note, "dimensions": list(img.array.shape), "n_channels": img.n_channels,
-                            "spatial_ndim": img.spatial_ndim, "spacing": list(img.spacing), "orientation": orientation_codes(img.affine),
-                            "dtype": img.source_dtype, "intensity_range": [float(img.array.min()), float(img.array.max())],
-                            "sha256": digest, "metadata": safe,
-                            "size_bytes": int(sum(f.stat().st_size for f in files)) if files else int(img.array.nbytes),
-                        })
+            if modality != "mri" and len(paths) > 1:
+                load_issues.append(issue("error", "multiple_paths", "Several paths per row are only supported for MRI sequences", ref))
+            else:
+                img = load_image_set(paths, modality)
+                mask_note = _attach_mask(rec, img, index, modality, load_issues, ref, storage)
+                for it in adapter.validate_input(img):
+                    load_issues.append({**it, "ref": ref})
+                for t in img.meta.get("phi_tags", []):
+                    phi_tags.append(t)
+                safe = {k: v for k, v in img.meta.items() if k != "phi_tags"}
+                if not any(i["level"] == "error" for i in load_issues):
+                    files = [p for p in paths if p.is_file()]
+                    digest = "-".join(sha256_file(p) for p in files)[:128] if files and len(files) == len(paths) else None
+                    image_data = {
+                        "status": "valid", "format": img.fmt, "file_paths": [storage.key(p) for p in paths], "file_path": storage.key(paths[0]),
+                        "mask_path": mask_note, "dimensions": list(img.array.shape), "n_channels": img.n_channels,
+                        "spatial_ndim": img.spatial_ndim, "spacing": list(img.spacing), "orientation": orientation_codes(img.affine),
+                        "dtype": img.source_dtype, "intensity_range": [float(img.array.min()), float(img.array.max())],
+                        "sha256": digest, "metadata": safe,
+                        "size_bytes": int(sum(f.stat().st_size for f in files)) if files else int(img.array.nbytes),
+                    }
         except ImageLoadError as exc:
-            local.append(issue("error", "unreadable", f"Cannot read image: {exc}", ref))
+            load_issues.append(issue("error", "unreadable", f"Cannot read image: {exc}", ref))
         except MissingDependencyError as exc:
-            local.append(issue("error", "missing_dependency", str(exc), ref))
-        except Exception as exc:  # corrupt input must never crash ingestion
-            local.append(issue("error", "unreadable", f"Unexpected error reading image: {type(exc).__name__}: {exc}", ref))
+            load_issues.append(issue("error", "missing_dependency", str(exc), ref))
+        except Exception as exc:
+            load_issues.append(issue("error", "unreadable", f"Unexpected error reading image: {type(exc).__name__}: {exc}", ref))
+        return n, load_issues, phi_tags, image_data, digest
+
+    load_results = {}
+    if to_load:
+        worker_count = min(8, os.cpu_count() or 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+            for n, load_issues, phi_tags, image_data, digest in pool.map(_load_and_validate, to_load):
+                load_results[n] = (load_issues, phi_tags, image_data, digest)
+
+    # Pass 3: Assemble docs, apply duplicate digest checks, and collect issues
+    images: list[dict] = []
+    for n, rec, doc, local, paths, has_prelim_error in preliminary_records:
+        ref = doc["source_ref"]
+        if not has_prelim_error and n in load_results:
+            load_issues, phi_tags, image_data, digest = load_results[n]
+            local.extend(load_issues)
+            for t in phi_tags:
+                phi[t] += 1
+            if image_data:
+                doc.update(image_data)
+            if digest:
+                if digest in seen_hash:
+                    dup_warn = issue("warning", "duplicate_content", f"Identical file content to {seen_hash[digest]}: duplicates can leak across splits", ref)
+                    local.append(dup_warn)
+                else:
+                    seen_hash[digest] = doc["image_id"]
+
         doc["issues"] = local
         if doc["status"] == "valid" and any(i["level"] == "error" for i in local):
             doc["status"] = "invalid"

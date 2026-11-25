@@ -1,5 +1,6 @@
-import { Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router-dom'
 import AppLayout from './layouts/AppLayout.jsx'
+import LandingPage from './pages/LandingPage.jsx'
 import Dashboard from './pages/Dashboard.jsx'
 import UploadPage from './pages/UploadPage.jsx'
 import DatasetPage from './pages/DatasetPage.jsx'
@@ -12,8 +13,13 @@ import ExportsPage from './pages/ExportsPage.jsx'
 export default function App() {
   return (
     <Routes>
+      {/* Interactive Video Scrollytelling Landing Page */}
+      <Route path="/" element={<LandingPage />} />
+
+      {/* Main Studio / Application Layout */}
       <Route element={<AppLayout />}>
-        <Route path="/" element={<Dashboard />} />
+        <Route path="/app" element={<Dashboard />} />
+        <Route path="/dashboard" element={<Navigate to="/app" replace />} />
         <Route path="/datasets/new" element={<UploadPage />} />
         <Route path="/datasets/:datasetId" element={<DatasetPage />} />
         <Route path="/datasets/:datasetId/augment" element={<AugmentPage />} />

@@ -256,3 +256,40 @@ def test_loose_file_upload_with_separate_manifest():
         raise AssertionError("path traversal in loose filename accepted")
     except AppError as e:
         assert e.code == "unsafe_path"
+
+
+def test_excel_manifest_and_multiclass_sheets():
+    import openpyxl
+    ctx, tmp = new_ctx()
+    # Create Normal.xlsx
+    wb1 = openpyxl.Workbook()
+    ws1 = wb1.active
+    ws1.append(["image_path", "patient_id"])
+    ws1.append(["images/norm1.png", "P01"])
+    ws1.append(["images/norm2.png", "P02"])
+    p1 = tmp / "Normal.xlsx"
+    wb1.save(p1)
+
+    # Create Rare.xlsx
+    wb2 = openpyxl.Workbook()
+    ws2 = wb2.active
+    ws2.append(["image_path", "patient_id"])
+    ws2.append(["images/rare1.png", "P03"])
+    p2 = tmp / "Rare.xlsx"
+    wb2.save(p2)
+
+    # Zip images + both Excel manifests together
+    z = zip_bytes({
+        "Normal.xlsx": p1.read_bytes(),
+        "Rare.xlsx": p2.read_bytes(),
+        "images/norm1.png": _png(50, seed=1),
+        "images/norm2.png": _png(60, seed=2),
+        "images/rare1.png": _png(70, seed=3),
+    }, tmp / "excel_dataset.zip")
+
+    d = ds.create_dataset(ctx, name="excel_test", modality="xray", layout="manifest", archives=[z], loose_files=[], manifest=None)
+    assert d["status"] == "ready"
+    assert d["classes"] == ["Normal", "Rare"]
+    assert d["counts"]["valid"] == 3
+    assert d["counts"]["patients"] == 3
+

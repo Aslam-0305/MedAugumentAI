@@ -64,8 +64,8 @@ export default function UploadPage() {
             <label className="flex items-start gap-3 cursor-pointer">
               <input type="radio" className="mt-1 h-4 w-4 text-teal-600 focus:ring-teal-500" checked={layout === 'manifest'} onChange={() => setLayout('manifest')} />
               <div>
-                <span className="font-bold text-slate-900">CSV manifest</span>
-                <p className="text-xs text-slate-600 mt-0.5">image_path, optional patient_id / split / mask_path, and label columns.</p>
+                <span className="font-bold text-slate-900">Manifest (CSV or Excel .xlsx / .xls)</span>
+                <p className="text-xs text-slate-600 mt-0.5">Single CSV/Excel, or multiple Excel files per class (e.g. Normal.xlsx, Rare.xlsx).</p>
               </div>
             </label>
             <label className="flex items-start gap-3 cursor-pointer">
@@ -78,7 +78,7 @@ export default function UploadPage() {
           </div>
         </fieldset>
 
-        <Field label="Dataset archive (.zip)" hint="Images, plus the manifest if you don’t upload it separately.">
+        <Field label="Dataset archive (.zip)" hint="Images, plus manifest spreadsheet(s) if you don’t upload separately.">
           <div className="mt-1.5 flex items-center rounded-xl border border-slate-200 bg-slate-50 p-2.5 shadow-sm transition-all hover:border-teal-400 focus-within:border-teal-500 focus-within:ring-2 focus-within:ring-teal-100">
             <input
               type="file"
@@ -91,11 +91,11 @@ export default function UploadPage() {
         </Field>
 
         {layout === 'manifest' && (
-          <Field label="Manifest (.csv), optional if inside the ZIP">
+          <Field label="Manifest (.csv, .xlsx, .xls), optional if inside the ZIP">
             <div className="mt-1.5 flex items-center rounded-xl border border-slate-200 bg-slate-50 p-2.5 shadow-sm transition-all hover:border-teal-400 focus-within:border-teal-500 focus-within:ring-2 focus-within:ring-teal-100">
               <input
                 type="file"
-                accept=".csv,text/csv"
+                accept=".csv,text/csv,.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
                 className="block w-full text-sm font-semibold text-slate-700 cursor-pointer"
                 onChange={(e) => setManifest(e.target.files[0] || null)}
               />

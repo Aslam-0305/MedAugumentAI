@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -11,10 +12,12 @@ from ..config import Settings
 from ..imaging.loaders import detect_format
 from ..utils.common import AppError
 
-RESERVED = {"image_path", "path", "file", "filename", "image", "patient_id", "subject_id", "patient", "split", "mask_path", "mask",
-            "modality", "label", "class", "labels"}
-PATH_COLS = ("image_path", "path", "file", "filename", "image")
-PATIENT_COLS = ("patient_id", "subject_id", "patient")
+RESERVED = {"image_path", "image_index", "image index", "image_name", "image name", "image_file", "imagefile", "path", "file", "filename", "file_name", "file name", "image", "filepath", "file_path",
+            "patient_id", "patient id", "patientid", "subject_id", "subject id", "subject", "patient", "case_id", "case id", "case", "split", "mask_path", "mask",
+            "modality", "label", "class", "labels", "diagnosis", "finding", "condition", "format", "size", "url"}
+PATH_COLS = ("image_path", "image_index", "image index", "image_name", "image name", "image_file", "imagefile", "path", "file", "filename", "file_name", "file name", "image", "filepath", "file_path")
+PATIENT_COLS = ("patient_id", "patient id", "patientid", "subject_id", "subject id", "subject", "patient", "case_id", "case id", "case")
+SINGLE_LABEL_COLS = ("label", "class", "diagnosis", "finding", "condition")
 JUNK = {".ds_store", "thumbs.db"}
 
 
@@ -79,8 +82,11 @@ class FileIndex:
         self.files = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
         self.dirs = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_dir()}
         self.by_base: dict[str, list[str]] = {}
+        self.by_stem: dict[str, list[str]] = {}
         for f in self.files:
-            self.by_base.setdefault(PurePosixPath(f).name, []).append(f)
+            p = PurePosixPath(f)
+            self.by_base.setdefault(p.name.lower(), []).append(f)
+            self.by_stem.setdefault(p.stem.lower(), []).append(f)
         tops = {PurePosixPath(f).parts[0] for f in self.files if len(PurePosixPath(f).parts) > 1}
         top_files = [f for f in self.files if len(PurePosixPath(f).parts) == 1]
         self.wrapper = next(iter(tops)) if len(tops) == 1 and not top_files else None
@@ -93,8 +99,29 @@ class FileIndex:
         for c in cands:
             if c in self.files or c in self.dirs:
                 return self.root / c
-        matches = self.by_base.get(PurePosixPath(rel).name, [])
-        return self.root / matches[0] if len(matches) == 1 else None
+
+        # Case-insensitive base match (e.g. covid-1.png -> COVID/images/COVID-1.png)
+        rel_base = PurePosixPath(rel).name.lower()
+        base_matches = self.by_base.get(rel_base, [])
+        if len(base_matches) == 1:
+            return self.root / base_matches[0]
+        elif len(base_matches) > 1:
+            non_masks = [m for m in base_matches if "mask" not in m.lower()]
+            if non_masks:
+                return self.root / non_masks[0]
+            return self.root / base_matches[0]
+
+        # Case-insensitive stem match (e.g. 'COVID-1' -> 'COVID/images/COVID-1.png')
+        rel_stem = PurePosixPath(rel).stem.lower()
+        stem_matches = self.by_stem.get(rel_stem, [])
+        if len(stem_matches) == 1:
+            return self.root / stem_matches[0]
+        elif len(stem_matches) > 1:
+            non_masks = [m for m in stem_matches if "mask" not in m.lower()]
+            if non_masks:
+                return self.root / non_masks[0]
+            return self.root / stem_matches[0]
+        return None
 
 
 # ------------------------------------------------------------------ annotations
@@ -125,39 +152,79 @@ def normalise_split(value: str | None) -> str | None:
     return _SPLITS.get((value or "").strip().lower())
 
 
-def parse_manifest(csv_path: Path) -> Parsed:
+def read_tabular_file(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """Reads a CSV or Excel (.xlsx / .xls) file into a list of row dicts and header list."""
+    suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xls"):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            sheet = wb.active
+            rows_iter = sheet.iter_rows(values_only=True)
+            headers: list[str] | None = None
+            for r in rows_iter:
+                if any(v is not None and str(v).strip() for v in r):
+                    headers = [str(v).strip() if v is not None else "" for v in r]
+                    break
+            if not headers:
+                wb.close()
+                return [], []
+            data_rows = []
+            for r in rows_iter:
+                if not any(v is not None and str(v).strip() for v in r):
+                    continue
+                row_dict = {}
+                for h, val in zip(headers, r):
+                    if h:
+                        row_dict[h] = "" if val is None else str(val).strip()
+                data_rows.append(row_dict)
+            wb.close()
+            return headers, data_rows
+        except Exception as exc:
+            raise AppError(f"Failed to read Excel file {path.name}: {exc}", 400, "bad_manifest")
+    else:
+        try:
+            text = Path(path).read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = Path(path).read_text(encoding="latin-1")
+        reader = csv.DictReader(text.splitlines())
+        fieldnames = [f.strip() for f in (reader.fieldnames or []) if f and f.strip()]
+        return fieldnames, list(reader)
+
+
+def parse_manifest(manifest_path: Path, default_label: str | None = None) -> Parsed:
     issues: list[dict] = []
-    try:
-        text = Path(csv_path).read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise AppError("The manifest must be UTF-8 encoded CSV text", 400, "bad_manifest") from exc
-    reader = csv.DictReader(text.splitlines())
-    if not reader.fieldnames:
-        raise AppError("The manifest CSV is empty", 400, "bad_manifest")
-    cols = {c.strip(): c for c in reader.fieldnames if c and c.strip()}
+    fieldnames, rows = read_tabular_file(manifest_path)
+    if not fieldnames:
+        raise AppError(f"The manifest spreadsheet ({manifest_path.name}) is empty", 400, "bad_manifest")
+    cols = {c.strip(): c for c in fieldnames if c and c.strip()}
     lower = {c.lower(): c for c in cols}
     path_col = next((cols[lower[c]] for c in PATH_COLS if c in lower), None)
     if path_col is None:
-        raise AppError(f"The manifest needs an image path column (one of: {', '.join(PATH_COLS)})", 400, "bad_manifest")
+        raise AppError(f"The manifest needs an image path column (found: {', '.join(fieldnames)})", 400, "bad_manifest")
     pat_col = next((cols[lower[c]] for c in PATIENT_COLS if c in lower), None)
     split_col, mask_col = (cols[lower[c]] if c in lower else None for c in ("split", "mask_path"))
     mask_col = mask_col or (cols[lower["mask"]] if "mask" in lower else None)
-    single_col = next((cols[lower[c]] for c in ("label", "class") if c in lower), None)
+    single_col = next((cols[lower[c]] for c in SINGLE_LABEL_COLS if c in lower), None)
     multi_col = cols[lower["labels"]] if "labels" in lower else None
-    rows = list(reader)
     if not rows:
-        raise AppError("The manifest has no rows", 400, "bad_manifest")
+        raise AppError(f"The manifest ({manifest_path.name}) has no data rows", 400, "bad_manifest")
 
     label_cols: list[str] = []
-    if not (single_col or multi_col):
-        for col in (c for c in reader.fieldnames if c and c.strip().lower() not in RESERVED):
+    has_explicit_labels = bool(single_col or multi_col)
+    if not has_explicit_labels:
+        for col in (c for c in fieldnames if c and c.strip().lower() not in RESERVED):
             vals = {(r.get(col) or "").strip().lower() for r in rows}
             if vals <= (_TRUE | _FALSE):
                 label_cols.append(col)
             else:
                 issues.append(issue("warning", "column_ignored", f"Column '{col}' is not binary (0/1) and was ignored", col))
-        if not label_cols:
-            raise AppError("No label information found. Provide a 'label' column, a 'labels' column (separated by |), or binary 0/1 columns per class", 400, "bad_manifest")
+        if label_cols:
+            has_explicit_labels = True
+
+    # If no explicit label columns exist but a default_label is provided (e.g. file is Normal.xlsx)
+    if not has_explicit_labels and not default_label:
+        raise AppError("No label information found. Provide a 'label' column, a 'labels' column, or binary 0/1 columns per class", 400, "bad_manifest")
 
     records: list[Record] = []
     for n, r in enumerate(rows, start=2):  # row 1 is the header
@@ -166,16 +233,87 @@ def parse_manifest(csv_path: Path) -> Parsed:
             labels = [x.strip() for x in (r.get(single_col) or "").split("|") if x.strip()]
         elif multi_col:
             labels = [x.strip() for x in (r.get(multi_col) or "").split("|") if x.strip()]
-        else:
+        elif label_cols:
             labels = [c.strip() for c in label_cols if (r.get(c) or "").strip().lower() in _TRUE]
+        else:
+            labels = [default_label] if default_label else []
+
         records.append(Record(n, raw_paths, labels, ((r.get(pat_col) or "").strip() or None) if pat_col else None,
                               ((r.get(mask_col) or "").strip() or None) if mask_col else None,
                               normalise_split(r.get(split_col)) if split_col else None))
         if split_col and r.get(split_col, "").strip() and normalise_split(r.get(split_col)) is None:
             issues.append(issue("warning", "unknown_split", f"Row {n}: unrecognised split '{r.get(split_col)}' (use train/val/test)", f"row {n}"))
-    classes = sorted({l for rec in records for l in rec.labels}) if not label_cols else [c.strip() for c in label_cols]
+
+    if label_cols:
+        classes = [c.strip() for c in label_cols]
+    elif default_label and not has_explicit_labels:
+        classes = [default_label]
+    else:
+        classes = sorted({l for rec in records for l in rec.labels})
+
     multilabel = bool(multi_col) or any(len(rec.labels) > 1 for rec in records)
     return Parsed(records, classes, "multilabel" if multilabel else "single", issues)
+
+
+def parse_manifests(manifest_paths: list[Path]) -> tuple[Parsed, str]:
+    """Parses one or multiple manifests (CSV or Excel) and compiles a unified manifest CSV."""
+    if not manifest_paths:
+        raise AppError("No manifest spreadsheet found (.csv, .xlsx, .xls)", 400, "bad_manifest")
+
+    all_records: list[Record] = []
+    all_issues: list[dict] = []
+    all_classes: set[str] = set()
+    is_multilabel = False
+
+    for m_path in manifest_paths:
+        # If multiple files exist, default label is the clean file stem (e.g. Normal.metadata.xlsx -> Normal, COVID.xlsx -> COVID)
+        stem_clean = m_path.name.replace(".metadata", "").split(".")[0].strip()
+        default_label = stem_clean if len(manifest_paths) > 1 else None
+        parsed = parse_manifest(m_path, default_label=default_label)
+        all_issues.extend(parsed.issues)
+        all_classes.update(parsed.classes)
+        if parsed.annotation_type == "multilabel":
+            is_multilabel = True
+
+        for rec in parsed.records:
+            rec.row = len(all_records) + 2
+            all_records.append(rec)
+
+    # Build unified CSV string
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    has_patient = any(r.raw_patient for r in all_records)
+    has_split = any(r.split for r in all_records)
+    has_mask = any(r.mask for r in all_records)
+
+    header = ["image_path"]
+    if has_patient:
+        header.append("patient_id")
+    header.append("label")
+    if has_split:
+        header.append("split")
+    if has_mask:
+        header.append("mask_path")
+    writer.writerow(header)
+
+    for rec in all_records:
+        row = [";".join(rec.paths)]
+        if has_patient:
+            row.append(rec.raw_patient or "")
+        row.append("|".join(rec.labels))
+        if has_split:
+            row.append(rec.split or "")
+        if has_mask:
+            row.append(rec.mask or "")
+        writer.writerow(row)
+
+    combined = Parsed(
+        records=all_records,
+        classes=sorted(all_classes),
+        annotation_type="multilabel" if is_multilabel else "single",
+        issues=all_issues,
+    )
+    return combined, buf.getvalue()
 
 
 def parse_folders(root: Path, index: FileIndex) -> Parsed:

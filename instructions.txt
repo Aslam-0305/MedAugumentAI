@@ -1,0 +1,7 @@
+cd backend
+python3 -m venv .venv (first time)
+source .venv/Scripts/activate
+pip install -r requirements.txt  (first time)
+cp .env.example .env  (first time)
+sed -i 's/DB_BACKEND=mongo/DB_BACKEND=file/' .env  (first time)
+python -m uvicorn app.main:app --reload
